@@ -1,0 +1,79 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>BLS Spain Assistant — Options</title>
+    <link rel="stylesheet" href="../styles/tokens.css" />
+    <link rel="stylesheet" href="options.css" />
+  </head>
+  <body>
+    <main class="options-page">
+      <h1 class="page-title">Options</h1>
+      <p class="lead muted">Preferences apply across the popup and side panel.</p>
+
+      <form id="optsForm" class="form">
+        <fieldset class="card fieldset">
+          <legend class="card-title">Appearance</legend>
+          <label class="row">
+            <span>Theme</span>
+            <select id="theme" name="theme" class="field-input">
+              <option value="light">Light</option>
+              <option value="dark">Dark</option>
+            </select>
+          </label>
+        </fieldset>
+
+        <fieldset class="card fieldset">
+          <legend class="card-title">Sign-in assist</legend>
+          <p class="muted small">
+            Opens the BLS site from Start. Optionally saves email and password in this browser only (local
+            storage) to prefill the login form. You must still complete any captcha or other checks yourself. This
+            extension will not attempt to solve, bypass, or evade them.
+          </p>
+          <label class="row">
+            <span>Login page URL</span>
+            <input id="targetLoginUrl" class="field-input" type="url" spellcheck="false" />
+          </label>
+          <label class="row row-check">
+            <input id="loginAssistEnabled" type="checkbox" />
+            <span>Enable automatic form fill when the page loads</span>
+          </label>
+          <label class="row">
+            <span>Account email</span>
+            <input id="loginEmail" class="field-input" type="email" autocomplete="off" />
+          </label>
+          <label class="row">
+            <span>Password</span>
+            <input id="loginPassword" class="field-input" type="password" autocomplete="new-password" />
+          </label>
+          <p class="muted small">Leave password blank when saving to keep the password already stored on this device.</p>
+        </fieldset>
+
+        <fieldset class="card fieldset">
+          <legend class="card-title">Log</legend>
+          <label class="row">
+            <span>Retention (days)</span>
+            <input id="logRetention" class="field-input" type="number" min="1" max="365" step="1" />
+          </label>
+          <p class="muted">Older log lines in the dashboard are removed when you save.</p>
+        </fieldset>
+
+        <fieldset class="card fieldset">
+          <legend class="card-title">Notifications</legend>
+          <label class="row row-check">
+            <input id="notifications" type="checkbox" />
+            <span>Enable notification preference (reserved for future use)</span>
+          </label>
+        </fieldset>
+
+        <div class="actions">
+          <button type="submit" class="btn btn-primary">Save</button>
+          <span id="saveStatus" class="muted" role="status" aria-live="polite"></span>
+        </div>
+      </form>
+    </main>
+    <script src="../shared/state.js"></script>
+    <script src="options.js"></script>
+  </body>
+</html>

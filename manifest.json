@@ -1,0 +1,26 @@
+{
+  "manifest_version": 3,
+  "name": "BLS Spain Assistant",
+  "version": "0.1.0",
+  "description": "Side panel dashboard and quick controls for workflow assistance.",
+  "permissions": ["storage", "sidePanel", "tabs", "windows"],
+  "host_permissions": ["https://appointment.thespainvisa.com/*"],
+  "background": {
+    "service_worker": "background/service_worker.js"
+  },
+  "content_scripts": [
+    {
+      "matches": ["https://appointment.thespainvisa.com/*"],
+      "js": ["content/fillLogin.js"],
+      "run_at": "document_idle"
+    }
+  ],
+  "action": {
+    "default_popup": "popup/popup.html",
+    "default_title": "BLS Spain Assistant"
+  },
+  "side_panel": {
+    "default_path": "sidepanel/dashboard.html"
+  },
+  "options_page": "options/options.html"
+}

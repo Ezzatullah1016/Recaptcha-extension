@@ -1,0 +1,14 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.env
+.env.*
+
+# Local / scratch
+Backend/_login_sample.html
+
+# OS
+.DS_Store
+Thumbs.db

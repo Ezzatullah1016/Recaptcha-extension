@@ -1,0 +1,25 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>BLS Spain Assistant</title>
+    <link rel="stylesheet" href="../styles/tokens.css" />
+    <link rel="stylesheet" href="popup.css" />
+  </head>
+  <body>
+    <main class="popup">
+      <header class="popup-header">
+        <span class="popup-title">Assistant</span>
+        <span id="statusChip" class="chip chip-idle" role="status">Idle</span>
+      </header>
+      <div class="popup-actions">
+        <button type="button" id="btnToggle" class="btn btn-primary btn-block">Start</button>
+        <button type="button" id="btnOpenPanel" class="btn btn-secondary btn-block">Open dashboard</button>
+        <button type="button" id="btnOptions" class="btn btn-secondary btn-block btn-ghost">Options</button>
+      </div>
+    </main>
+    <script src="../shared/state.js"></script>
+    <script src="popup.js"></script>
+  </body>
+</html>

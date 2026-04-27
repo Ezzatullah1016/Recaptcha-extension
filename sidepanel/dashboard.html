@@ -1,0 +1,117 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Dashboard</title>
+    <link rel="stylesheet" href="../styles/tokens.css" />
+    <link rel="stylesheet" href="dashboard.css" />
+  </head>
+  <body>
+    <div class="shell">
+      <header class="topbar">
+        <div class="topbar-row">
+          <h1 class="brand">BLS Spain Assistant</h1>
+          <span id="headerChip" class="chip chip-idle" role="status">Idle</span>
+        </div>
+        <div class="topbar-actions">
+          <button type="button" id="headerStartStop" class="btn btn-primary">Start</button>
+          <button type="button" id="headerOptions" class="btn btn-secondary">Options</button>
+        </div>
+      </header>
+
+      <section class="timeline card" aria-label="Step timeline">
+        <h2 class="card-title">Timeline</h2>
+        <ol id="timeline" class="timeline-list">
+          <li class="timeline-item" data-state="idle"><span class="dot"></span> Session</li>
+          <li class="timeline-item" data-state="idle"><span class="dot"></span> Captcha assistance</li>
+          <li class="timeline-item" data-state="idle"><span class="dot"></span> Network</li>
+          <li class="timeline-item" data-state="idle"><span class="dot"></span> Verification</li>
+          <li class="timeline-item" data-state="idle"><span class="dot"></span> Documents</li>
+        </ol>
+      </section>
+
+      <div class="grid">
+        <article class="card" data-card="session">
+          <h2 class="card-title">Session</h2>
+          <div class="card-body">
+            <label class="field-label" for="sessionEmail">Account email</label>
+            <input id="sessionEmail" class="field-input" type="email" autocomplete="off" placeholder="you@example.com" />
+            <p id="sessionHint" class="muted placeholder-empty">Not connected. Enter email for your own records.</p>
+          </div>
+        </article>
+
+        <article class="card" data-card="captcha">
+          <h2 class="card-title">Human verification</h2>
+          <div class="card-body">
+            <p class="muted small">
+              The extension will not auto-solve or bypass captchas. When the site shows one, complete it in the tab
+              like any normal user.
+            </p>
+            <p id="captchaLine" class="placeholder-empty">No sign-in page activity yet. Start the workflow, then use the open tab.</p>
+            <p id="captchaMeta" class="muted"></p>
+          </div>
+        </article>
+
+        <article class="card" data-card="network">
+          <h2 class="card-title">Network</h2>
+          <div class="card-body">
+            <p><strong>Endpoint:</strong> <span id="netLabel" class="mono">—</span></p>
+            <p><strong>Last HTTP:</strong> <span id="netHttp" class="mono placeholder-empty">—</span></p>
+            <p id="netErr" class="placeholder-error" hidden></p>
+          </div>
+        </article>
+
+        <article class="card" data-card="verification">
+          <h2 class="card-title">Verification</h2>
+          <div class="card-body">
+            <p id="verifyState" class="placeholder-empty">State: idle</p>
+            <button type="button" id="btnInbox" class="btn btn-secondary">Open inbox</button>
+          </div>
+        </article>
+
+        <article class="card card-wide" data-card="images">
+          <h2 class="card-title">Images</h2>
+          <div class="card-body image-row">
+            <div
+              id="dropZone"
+              class="dropzone"
+              tabindex="0"
+              role="button"
+              aria-label="Drop image or choose file"
+            >
+              <span class="placeholder-empty">Drop image here or click to choose</span>
+              <input id="fileInput" type="file" accept="image/*" hidden />
+            </div>
+            <div class="preview-wrap">
+              <canvas id="previewCanvas" width="120" height="120" aria-label="Preview"></canvas>
+              <p id="dimsLabel" class="muted mono"></p>
+            </div>
+          </div>
+        </article>
+
+        <article class="card card-wide collapsible" data-card="diagnostics">
+          <button type="button" class="collapsible-trigger" id="diagToggle" aria-expanded="false">
+            <span class="card-title" style="margin: 0">Diagnostics</span>
+            <span class="chevron" aria-hidden="true">▸</span>
+          </button>
+          <div class="collapsible-panel" id="diagPanel" hidden>
+            <p class="mono" id="diagUa"></p>
+            <p class="muted mono" id="diagVersion"></p>
+            <p class="mono" id="diagCheckpoint"></p>
+          </div>
+        </article>
+      </div>
+
+      <section class="card log-card" aria-label="Activity log">
+        <h2 class="card-title">Log</h2>
+        <div id="logBox" class="log-box mono" role="log" aria-live="polite"></div>
+        <footer class="footer-links">
+          <button type="button" class="link" id="linkOptions">Open options</button>
+        </footer>
+      </section>
+    </div>
+    <script src="../shared/state.js"></script>
+    <script src="dashboard.js"></script>
+  </body>
+</html>

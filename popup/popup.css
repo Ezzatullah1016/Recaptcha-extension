@@ -1,0 +1,37 @@
+html,
+body {
+  min-width: 280px;
+}
+
+.popup {
+  padding: var(--space-4);
+  background: var(--bg-canvas);
+}
+
+.popup-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: var(--space-4);
+}
+
+.popup-title {
+  font-weight: 700;
+  font-size: var(--text-lg);
+}
+
+.popup-actions {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+}
+
+.btn-ghost {
+  background: transparent;
+  border-color: transparent;
+  font-weight: 500;
+}
+
+.btn-ghost:hover:not(:disabled) {
+  background: var(--bg-muted);
+}
