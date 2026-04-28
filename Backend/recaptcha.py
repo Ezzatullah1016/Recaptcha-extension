@@ -24,10 +24,23 @@ Optional:
     input (no other matrix names). Try if the default POST still returns ?err=.
   SPAIN_VISA_HTTP_RETRIES — how many times to retry after HTTP 429 (default 4).
   SPAIN_VISA_HTTP_BACKOFF_SEC — base wait seconds before first 429 retry (default 8; doubles each time).
+  SPAIN_VISA_MIN_REQUEST_GAP_SEC — minimum delay between requests (default 2.5) to avoid burst traffic.
+  SPAIN_VISA_429_COOLDOWN_SEC — cooldown before each retry when 429 block page is detected (default 60).
+  SPAIN_VISA_NET_RESET_RETRIES — retries for transient connection reset/abort errors (default 3).
+  SPAIN_VISA_FAIL_ON_429 — "1" (default) to stop immediately if still blocked after retries.
   SPAIN_VISA_START_DELAY_SEC — optional extra delay in seconds before the first request (e.g. 30).
+  SPAIN_VISA_STEP2_BOOK_NOW — "1" (default) to automatically open Book New Appointment
+    after login/captcha when possible, "0" to stop at the first post-login page.
+  SPAIN_VISA_BOOK_URL — optional absolute/relative URL override for step 2 (e.g.
+    /Global/appointment/newappointment).
+  SPAIN_VISA_PLAYWRIGHT_DEBUG — "1" to print Playwright URL/status trace and server alerts.
+  SPAIN_VISA_PLAYWRIGHT_HOLD_ON_FAIL_SEC — keep browser open N seconds on failure (default 5 in headed mode).
 
 Dependencies: pip install requests beautifulsoup4 pillow
 OCR (recommended): install Tesseract, then pip install pytesseract
+OCR fallback (optional, stronger on noisy images): pip install easyocr opencv-python numpy
+Browser mode (recommended when requests login is blocked): pip install playwright
+  then run once: playwright install chromium
 """
 
 from __future__ import annotations
@@ -67,6 +80,79 @@ DEFAULT_HEADERS = {
     "Cache-Control": "max-age=0",
 }
 
+_LAST_REQUEST_TS = 0.0
+
+
+def _pace_requests() -> None:
+    global _LAST_REQUEST_TS
+    min_gap = max(0.0, _env_float("SPAIN_VISA_MIN_REQUEST_GAP_SEC", 2.5))
+    if min_gap <= 0:
+        return
+    now = time.time()
+    wait = (_LAST_REQUEST_TS + min_gap) - now
+    if wait > 0:
+        time.sleep(wait)
+    _LAST_REQUEST_TS = time.time()
+
+
+def _is_rate_limit_html(text: str) -> bool:
+    t = (text or "").lower()
+    markers = (
+        "<h1>too many requests</h1>",
+        "our service is currently receiving unusually high traffic",
+        "detected excessive requests from your ip",
+        "please try again after some time",
+    )
+    return any(m in t for m in markers)
+
+
+def _is_rate_limited_response(resp: requests.Response) -> bool:
+    if resp.status_code == 429:
+        return True
+    ctype = (resp.headers.get("content-type") or "").lower()
+    if "text/html" in ctype and _is_rate_limit_html(resp.text):
+        return True
+    return False
+
+
+def _force_https(url: str) -> str:
+    if url.lower().startswith("http://"):
+        return "https://" + url[len("http://") :]
+    return url
+
+
+def _is_transient_network_reset_error(exc: BaseException) -> bool:
+    msg = str(exc).lower()
+    markers = (
+        "connection aborted",
+        "forcibly closed by the remote host",
+        "connection reset",
+        "10054",
+        "remote end closed connection without response",
+    )
+    return any(m in msg for m in markers)
+
+
+def _looks_like_login_page(url: str, html: str) -> bool:
+    ul = (url or "").lower()
+    if "/account/login" in ul:
+        return True
+    hl = (html or "").lower()
+    markers = (
+        "/global/account/loginsubmit",
+        "returnurl=",
+        "id=\"btnsubmit\"",
+        "onsubmitverify(",
+    )
+    return any(m in hl for m in markers)
+
+
+class FlowResult:
+    def __init__(self, url: str, status_code: int, text: str) -> None:
+        self.url = url
+        self.status_code = status_code
+        self.text = text
+
 
 def _env_int(name: str, default: int) -> int:
     try:
@@ -89,30 +175,72 @@ def request_with_429_retry(
     **kwargs: Any,
 ) -> requests.Response:
     """
-    Retry on HTTP 429 (rate limit) with exponential backoff. Returns last response
-    (possibly still 429) if all retries are exhausted.
+    Retry when rate-limited (HTTP 429 or explicit block HTML page), and for
+    transient network reset/abort errors. Also forces HTTPS across redirects.
+    Returns first non-blocked response.
     """
     max_retries = max(0, _env_int("SPAIN_VISA_HTTP_RETRIES", 4))
+    net_retries = max(0, _env_int("SPAIN_VISA_NET_RESET_RETRIES", 3))
     base_wait = _env_float("SPAIN_VISA_HTTP_BACKOFF_SEC", 8.0)
+    cooldown = max(1.0, _env_float("SPAIN_VISA_429_COOLDOWN_SEC", 60.0))
     start = _env_float("SPAIN_VISA_START_DELAY_SEC", 0.0)
     if start > 0:
         time.sleep(start)
 
+    caller_allow_redirects = bool(kwargs.pop("allow_redirects", True))
     last: requests.Response | None = None
+    net_failures = 0
     for attempt in range(max_retries + 1):
+        _pace_requests()
         m = method.lower()
-        if m == "get":
-            last = session.get(url, **kwargs)
-        elif m == "post":
-            last = session.post(url, **kwargs)
-        else:
-            raise ValueError(f"Unsupported method: {method}")
-        if last.status_code != 429:
+        req_url = _force_https(url)
+        req_kwargs = dict(kwargs)
+        try:
+            if not caller_allow_redirects:
+                if m == "get":
+                    last = session.get(req_url, allow_redirects=False, **req_kwargs)
+                elif m == "post":
+                    last = session.post(req_url, allow_redirects=False, **req_kwargs)
+                else:
+                    raise ValueError(f"Unsupported method: {method}")
+            else:
+                for _ in range(10):
+                    if m == "get":
+                        last = session.get(req_url, allow_redirects=False, **req_kwargs)
+                    elif m == "post":
+                        last = session.post(req_url, allow_redirects=False, **req_kwargs)
+                    else:
+                        raise ValueError(f"Unsupported method: {method}")
+
+                    if last.is_redirect or last.is_permanent_redirect:
+                        loc = (last.headers.get("Location") or "").strip()
+                        if not loc:
+                            break
+                        req_url = _force_https(urljoin(last.url, loc))
+                        if last.status_code in (301, 302, 303):
+                            m = "get"
+                            req_kwargs.pop("data", None)
+                            req_kwargs.pop("json", None)
+                        continue
+                    break
+        except requests.RequestException as e:
+            if _is_transient_network_reset_error(e) and net_failures < net_retries:
+                net_failures += 1
+                wait = max(cooldown, base_wait * (2**min(net_failures - 1, 6))) + random.uniform(0.5, 2.0)
+                print(
+                    f"Connection reset/aborted by remote host — waiting {wait:.0f}s before retry "
+                    f"({net_failures}/{net_retries})...",
+                    file=sys.stderr,
+                )
+                time.sleep(wait)
+                continue
+            raise
+        if not _is_rate_limited_response(last):
             return last
         if attempt < max_retries:
-            wait = base_wait * (2**attempt) + random.uniform(0.5, 2.0)
+            wait = max(cooldown, base_wait * (2**attempt) + random.uniform(0.5, 2.0))
             print(
-                f"HTTP 429 Too Many Requests — waiting {wait:.0f}s before retry "
+                f"Rate-limited (HTTP 429 / block page) — waiting {wait:.0f}s before retry "
                 f"({attempt + 1}/{max_retries})...",
                 file=sys.stderr,
             )
@@ -126,7 +254,8 @@ def print_429_help() -> None:
         "\nThe site returned HTTP 429 (rate limit): too many requests from this IP or heavy traffic.\n"
         "This is server-side protection, not a bug in the script logic.\n"
         "Options:\n"
-        "  • Wait 15–60 minutes and try again; set $env:SPAIN_VISA_START_DELAY_SEC='30' before running.\n"
+        "  • Wait 15–60 minutes and try again; set $env:SPAIN_VISA_START_DELAY_SEC='60' before running.\n"
+        "  • Increase cooldown and retries, e.g. SPAIN_VISA_429_COOLDOWN_SEC=120 and SPAIN_VISA_HTTP_RETRIES=6.\n"
         "  • Use a different network (mobile hotspot / another ISP) to get a different IP.\n"
         "  • Slow down: avoid repeated runs, browser extensions, and other tools hitting the same site.\n"
         "  • If automation must continue, control the same session as a real browser (e.g. Playwright) — "
@@ -211,7 +340,30 @@ def ocr_digits_from_image(image_bytes: bytes) -> str:
             img,
             config="--oem 3 --psm 6 -c tessedit_char_whitelist=0123456789",
         )
-        return re.sub(r"\D", "", raw)
+        digits = re.sub(r"\D", "", raw)
+        if digits:
+            return digits
+    except Exception:
+        pass
+
+    # Optional fallback OCR engine (useful when Tesseract misses stylized digits).
+    # Requires: easyocr, opencv-python, numpy
+    try:
+        import cv2  # type: ignore
+        import easyocr  # type: ignore
+        import numpy as np  # type: ignore
+
+        arr = np.frombuffer(image_bytes, dtype=np.uint8)
+        src = cv2.imdecode(arr, cv2.IMREAD_GRAYSCALE)
+        if src is None:
+            return ""
+        proc = cv2.resize(src, None, fx=3.0, fy=3.0, interpolation=cv2.INTER_CUBIC)
+        proc = cv2.GaussianBlur(proc, (3, 3), 0)
+        _, proc = cv2.threshold(proc, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        reader = easyocr.Reader(["en"], gpu=False, verbose=False)
+        found = reader.readtext(proc, detail=0, paragraph=False, allowlist="0123456789")
+        text = "".join(str(x) for x in found)
+        return re.sub(r"\D", "", text)
     except Exception:
         return ""
 
@@ -345,8 +497,10 @@ def _collect_password_inputs(form: Any) -> list[Any]:
 
 def submit_login(session: requests.Session, email: str, password: str) -> requests.Response:
     r = request_with_429_retry(session, "get", LOGIN_PAGE, timeout=60)
-    if r.status_code == 429:
+    if _is_rate_limited_response(r):
         print_429_help()
+        if os.environ.get("SPAIN_VISA_FAIL_ON_429", "1").strip() == "1":
+            raise RuntimeError("Rate-limited on login page; stopping before next step.")
     r.raise_for_status()
     raw_html = r.text
     soup = BeautifulSoup(raw_html, "html.parser")
@@ -412,19 +566,23 @@ def submit_login(session: requests.Session, email: str, password: str) -> reques
     post_resp = request_with_429_retry(
         session, "post", action, data=payload, timeout=60, allow_redirects=True
     )
-    if post_resp.status_code == 429:
+    if _is_rate_limited_response(post_resp):
         print_429_help()
+        if os.environ.get("SPAIN_VISA_FAIL_ON_429", "1").strip() == "1":
+            raise RuntimeError("Rate-limited on login submit; stopping before next step.")
         post_resp.raise_for_status()
     return post_resp
 
 
 def build_captcha_response_data(form: Any, password: str) -> str:
     obj: dict[str, str] = {}
-    for inp in form.find_all("input", type=lambda t: (t or "").lower() == "password"):
+    pw_inputs = _collect_password_inputs(form)
+    active_pw = next((p for p in pw_inputs if _visible(p) and _submittable(p)), None)
+    for inp in pw_inputs:
         key = inp.get("id") or inp.get("name")
         if not key:
             continue
-        obj[key] = password if _visible(inp) else ""
+        obj[key] = password if inp is active_pw else ""
     return json.dumps(obj, separators=(",", ":"))
 
 
@@ -455,6 +613,22 @@ def submit_captcha(
         if itype == "hidden":
             payload[name] = inp.get("value") or ""
 
+    # Mirror browser behavior for dynamic captcha password fields:
+    # one active input carries the password, honeypot/disabled ones remain empty.
+    pw_inputs = _collect_password_inputs(form)
+    if len(pw_inputs) == 1 and _visible(pw_inputs[0]) and _submittable(pw_inputs[0]):
+        payload[pw_inputs[0]["name"]] = password
+    elif len(pw_inputs) > 1:
+        active_pw = next(
+            (p for p in pw_inputs if _visible(p) and _submittable(p)),
+            pw_inputs[0],
+        )
+        for inp in pw_inputs:
+            n = inp.get("name")
+            if not n or not _submittable(inp):
+                continue
+            payload[n] = password if inp is active_pw else ""
+
     payload["SelectedImages"] = ",".join(selected_ids)
     payload["ResponseData"] = build_captcha_response_data(form, password)
 
@@ -464,10 +638,61 @@ def submit_captcha(
     post_resp = request_with_429_retry(
         session, "post", action, data=payload, timeout=60, allow_redirects=True
     )
-    if post_resp.status_code == 429:
+    if _is_rate_limited_response(post_resp):
         print_429_help()
+        if os.environ.get("SPAIN_VISA_FAIL_ON_429", "1").strip() == "1":
+            raise RuntimeError("Rate-limited on captcha submit; stopping before next step.")
         post_resp.raise_for_status()
     return post_resp
+
+
+def find_book_new_appointment_url(html: str, base_url: str) -> str | None:
+    soup = BeautifulSoup(html, "html.parser")
+
+    # Fast path: known endpoint appears in href.
+    for a in soup.find_all("a", href=True):
+        href = (a.get("href") or "").strip()
+        if not href:
+            continue
+        if "/appointment/newappointment" in href.lower():
+            return _absolute_url(href)
+
+    # Fallback: discover links by visible text labels.
+    wanted = ("book now", "book new appointment", "new appointment")
+    for a in soup.find_all("a", href=True):
+        txt = a.get_text(" ", strip=True).lower()
+        if any(w in txt for w in wanted):
+            href = (a.get("href") or "").strip()
+            if href:
+                return urljoin(base_url, href)
+    return None
+
+
+def open_book_new_appointment(
+    session: requests.Session,
+    page_html: str,
+    page_url: str,
+) -> requests.Response | None:
+    if os.environ.get("SPAIN_VISA_STEP2_BOOK_NOW", "1").strip() == "0":
+        return None
+
+    override = os.environ.get("SPAIN_VISA_BOOK_URL", "").strip()
+    if override:
+        target = _absolute_url(override) if not override.startswith("http") else override
+    else:
+        target = find_book_new_appointment_url(page_html, page_url)
+
+    if not target:
+        return None
+
+    session.headers["Referer"] = page_url
+    session.headers["Origin"] = BASE
+    session.headers["Sec-Fetch-Site"] = "same-origin"
+    r = request_with_429_retry(session, "get", target, timeout=60, allow_redirects=True)
+    if r.status_code == 429:
+        print_429_help()
+        r.raise_for_status()
+    return r
 
 
 def run_flow(email: str, password: str) -> requests.Response:
@@ -477,20 +702,30 @@ def run_flow(email: str, password: str) -> requests.Response:
     captcha_only = os.environ.get("SPAIN_VISA_CAPTCHA_URL", "").strip()
     if captcha_only:
         last = request_with_429_retry(session, "get", captcha_only, timeout=60)
-        if last.status_code == 429:
+        if _is_rate_limited_response(last):
             print_429_help()
+            raise RuntimeError("Rate-limited while opening captcha page; stopping before next step.")
         last.raise_for_status()
         html, final_url = last.text, last.url
     else:
         last = submit_login(session, email, password)
         html, final_url = last.text, last.url
 
+    if _is_rate_limit_html(html):
+        print_429_help()
+        raise RuntimeError("Rate-limit block page detected; stopping before next step.")
+    if _looks_like_login_page(final_url, html):
+        raise RuntimeError(
+            "Authentication did not establish a logged-in session (returned to login page)."
+        )
+
     if (
         "logincaptcha" not in final_url.lower()
         and "newcaptcha" not in html.lower()
         and "captcha-img" not in html.lower()
     ):
-        return last
+        step2 = open_book_new_appointment(session, html, final_url)
+        return step2 or last
 
     target = parse_captcha_target_number(html)
     tiles = collect_captcha_tiles(html)
@@ -504,7 +739,397 @@ def run_flow(email: str, password: str) -> requests.Response:
             file=sys.stderr,
         )
 
-    return submit_captcha(session, html, final_url, password, selected)
+    after_captcha = submit_captcha(session, html, final_url, password, selected)
+    if _looks_like_login_page(after_captcha.url, after_captcha.text):
+        raise RuntimeError(
+            "Captcha/login flow returned to login page; session is not authenticated yet."
+        )
+    step2 = open_book_new_appointment(session, after_captcha.text, after_captcha.url)
+    out = step2 or after_captcha
+    if _looks_like_login_page(out.url, out.text):
+        raise RuntimeError(
+            "Step 2 redirected back to login page; authentication is still blocked."
+        )
+    return out
+
+
+def _playwright_targets(page: Any) -> list[Any]:
+    out = [page]
+    try:
+        out.extend(page.frames)
+    except Exception:
+        pass
+    return out
+
+
+def _playwright_fill_visible_input(page: Any, selector: str, value: str) -> bool:
+    for target in _playwright_targets(page):
+        items = target.locator(selector)
+        n = items.count()
+        for i in range(n):
+            el = items.nth(i)
+            try:
+                if not el.is_visible():
+                    continue
+                # Some dynamic fields are initially readonly/disabled in anti-bot forms.
+                # Try normal fill first, then force value via JS event dispatch.
+                try:
+                    el.fill(value, timeout=3000)
+                    return True
+                except Exception:
+                    el.evaluate(
+                        """(node, val) => {
+                            try { node.removeAttribute('readonly'); } catch(e) {}
+                            try { node.removeAttribute('disabled'); } catch(e) {}
+                            node.value = val;
+                            node.dispatchEvent(new Event('input', { bubbles: true }));
+                            node.dispatchEvent(new Event('change', { bubbles: true }));
+                        }""",
+                        value,
+                    )
+                    return True
+            except Exception:
+                continue
+    return False
+
+
+def _playwright_fill_login_email(page: Any, email: str) -> bool:
+    selectors = [
+        "input[type='email']",
+        "input[name*='mail' i]",
+        "input[id*='mail' i]",
+        "form[action*='loginsubmit' i] input[type='text']",
+        "input[type='text']",
+    ]
+    for sel in selectors:
+        if _playwright_fill_visible_input(page, sel, email):
+            return True
+    return False
+
+
+def _playwright_fill_login_password(page: Any, password: str) -> bool:
+    selectors = [
+        "input[type='password']",
+        "input[autocomplete='current-password']",
+        "input[name*='pass' i]",
+        "input[id*='pass' i]",
+    ]
+    for sel in selectors:
+        if _playwright_fill_visible_input(page, sel, password):
+            return True
+    return False
+
+
+def _playwright_fill_login_fields(page: Any, email: str, password: str) -> tuple[bool, bool]:
+    """
+    Fill email/password from the same LoginSubmit form to avoid cross-field mixups.
+    Returns (email_filled, password_filled).
+    """
+    for target in _playwright_targets(page):
+        try:
+            out = target.evaluate(
+                """(args) => {
+                    const emailVal = args.email || "";
+                    const passVal = args.password || "";
+                    const form = document.querySelector('form[action*="LoginSubmit" i]') || document.querySelector("form");
+                    if (!form) return { emailFilled: false, passwordFilled: false };
+
+                    const isVisible = (el) => {
+                        if (!el) return false;
+                        const st = window.getComputedStyle(el);
+                        if (!st) return true;
+                        return st.display !== "none" && st.visibility !== "hidden";
+                    };
+                    const canUse = (el) => {
+                        if (!el || el.disabled) return false;
+                        if (!isVisible(el)) return false;
+                        return true;
+                    };
+                    const patch = (el, val) => {
+                        try { el.removeAttribute("readonly"); } catch (e) {}
+                        try { el.removeAttribute("disabled"); } catch (e) {}
+                        el.focus();
+                        el.value = val;
+                        el.dispatchEvent(new Event("input", { bubbles: true }));
+                        el.dispatchEvent(new Event("change", { bubbles: true }));
+                    };
+                    const hasCls = (el, c) => (el.classList ? el.classList.contains(c) : false);
+
+                    const all = Array.from(form.querySelectorAll("input"));
+                    const emailCandidates = all.filter((el) => {
+                        const t = (el.type || "text").toLowerCase();
+                        const k = ((el.name || "") + " " + (el.id || "")).toLowerCase();
+                        if (!canUse(el)) return false;
+                        if (t === "hidden" || t === "password") return false;
+                        if (k.includes("pass")) return false;
+                        return (t === "email" || t === "text" || t === "tel");
+                    });
+                    const pwCandidates = all.filter((el) => {
+                        const t = (el.type || "").toLowerCase();
+                        const k = ((el.name || "") + " " + (el.id || "")).toLowerCase();
+                        if (!canUse(el)) return false;
+                        return t === "password" || k.includes("pass");
+                    });
+
+                    const pickEmail =
+                        emailCandidates.find((el) => !hasCls(el, "entry-disabled")) ||
+                        emailCandidates[0] ||
+                        null;
+                    const pickPw =
+                        pwCandidates.find((el) => !hasCls(el, "entry-disabled")) ||
+                        pwCandidates[0] ||
+                        null;
+
+                    let emailFilled = false;
+                    let passwordFilled = false;
+                    if (pickEmail && emailVal) {
+                        patch(pickEmail, emailVal);
+                        emailFilled = true;
+                    }
+                    if (pickPw && passVal && pickPw !== pickEmail) {
+                        patch(pickPw, passVal);
+                        passwordFilled = true;
+                    }
+                    return { emailFilled, passwordFilled };
+                }""",
+                {"email": email, "password": password},
+            )
+            if out and (out.get("emailFilled") or out.get("passwordFilled")):
+                return bool(out.get("emailFilled")), bool(out.get("passwordFilled"))
+        except Exception:
+            continue
+    return False, False
+
+
+def _playwright_submit_login(page: Any) -> str:
+    # Prefer the page's own JS submit pipeline because it builds dynamic ResponseData.
+    for target in _playwright_targets(page):
+        try:
+            has_submit_fn = target.evaluate("() => typeof OnSubmitVerify === 'function'")
+            if has_submit_fn:
+                ok = target.evaluate(
+                    """() => {
+                        const pass = OnSubmitVerify();
+                        if (pass === false) return false;
+                        const f = document.querySelector('form[action*="LoginSubmit" i]') || document.querySelector("form");
+                        if (!f) return false;
+                        if (typeof f.requestSubmit === "function") f.requestSubmit();
+                        else f.submit();
+                        return true;
+                    }"""
+                )
+                if ok:
+                    return "OnSubmitVerify+submit"
+        except Exception:
+            continue
+
+    # Fallback 1: click known login submit controls.
+    for target in _playwright_targets(page):
+        btn = target.locator(
+            "#btnSubmit, button#btnSubmit, button[type='submit'], input[type='submit']"
+        ).first
+        try:
+            if btn.count() > 0 and btn.is_visible():
+                btn.click(timeout=10000)
+                return "click_btnSubmit"
+        except Exception:
+            pass
+
+    # Fallback 2: submit login form directly.
+    for target in _playwright_targets(page):
+        try:
+            ok = target.evaluate(
+                """() => {
+                    const f = document.querySelector('form[action*="LoginSubmit" i]');
+                    if (!f) return false;
+                    if (typeof f.requestSubmit === 'function') f.requestSubmit();
+                    else f.submit();
+                    return true;
+                }"""
+            )
+            if ok:
+                return "form_submit"
+        except Exception:
+            continue
+    raise RuntimeError("Could not trigger login submit in browser mode.")
+
+
+def _playwright_snapshot(page: Any, attempts: int = 5) -> tuple[str, str]:
+    last_err: Exception | None = None
+    for _ in range(max(1, attempts)):
+        try:
+            page.wait_for_load_state("domcontentloaded", timeout=20000)
+        except Exception:
+            pass
+        try:
+            return page.url, page.content()
+        except Exception as e:
+            last_err = e
+            time.sleep(0.7)
+    if last_err is not None:
+        raise RuntimeError(f"Could not snapshot page content during navigation: {last_err}")
+    raise RuntimeError("Could not snapshot page content during navigation.")
+
+
+def run_flow_playwright(email: str, password: str) -> FlowResult:
+    try:
+        from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
+        from playwright.sync_api import sync_playwright
+    except Exception as e:
+        raise RuntimeError(
+            "Playwright mode requested but dependency is missing. "
+            "Install with: pip install playwright && playwright install chromium"
+        ) from e
+
+    book_override = os.environ.get("SPAIN_VISA_BOOK_URL", "").strip()
+    headless = os.environ.get("SPAIN_VISA_PLAYWRIGHT_HEADLESS", "0").strip() == "1"
+    pw_debug = os.environ.get("SPAIN_VISA_PLAYWRIGHT_DEBUG", "1").strip() == "1"
+    browser = None
+    try:
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=headless)
+            context = browser.new_context(
+                user_agent=DEFAULT_HEADERS["User-Agent"],
+                locale="en-GB",
+                timezone_id="Asia/Karachi",
+            )
+            page = context.new_page()
+            net_trace: list[str] = []
+            auth_trace: list[str] = []
+            if pw_debug:
+                def _on_response(resp: Any) -> None:
+                    try:
+                        u = resp.url
+                        if "appointment.thespainvisa.com" in u.lower():
+                            net_trace.append(f"{resp.status} {u}")
+                            ul = u.lower()
+                            if (
+                                "loginsubmit" in ul
+                                or "/global/account/login" in ul
+                                or "logincaptcha" in ul
+                                or "newcaptcha" in ul
+                                or "err=" in ul
+                            ):
+                                auth_trace.append(f"{resp.status} {u}")
+                    except Exception:
+                        pass
+                page.on("response", _on_response)
+            page.goto(LOGIN_PAGE, wait_until="domcontentloaded", timeout=90000)
+
+            if _is_rate_limit_html(page.content()):
+                raise RuntimeError("Rate-limit block page detected in browser mode.")
+
+            em_ok, pw_ok = _playwright_fill_login_fields(page, email, password)
+            if not em_ok and not _playwright_fill_login_email(page, email):
+                raise RuntimeError("Could not find active email input in browser mode.")
+            if not pw_ok:
+                pw_ok = _playwright_fill_login_password(page, password)
+            # Some login variants only require email first and request password/captcha next.
+            # Do not hard-fail if password field is missing on the initial screen.
+
+            submit_path = _playwright_submit_login(page)
+            page.wait_for_load_state("domcontentloaded", timeout=90000)
+            page.wait_for_load_state("networkidle", timeout=30000)
+            time.sleep(2.0)
+
+            cur, html = _playwright_snapshot(page)
+            if _is_rate_limit_html(html):
+                raise RuntimeError("Rate-limit block page detected after login submit.")
+            if _looks_like_login_page(cur, html):
+                # If no submit endpoint was called, try a second, more direct submit.
+                saw_login_submit = any("loginsubmit" in x.lower() for x in net_trace)
+                if not saw_login_submit:
+                    try:
+                        page.evaluate(
+                            """() => {
+                                const f = document.querySelector('form[action*="LoginSubmit" i]');
+                                if (!f) return false;
+                                if (typeof OnSubmitVerify === 'function') OnSubmitVerify();
+                                else if (typeof f.requestSubmit === 'function') f.requestSubmit();
+                                else f.submit();
+                                return true;
+                            }"""
+                        )
+                        page.wait_for_load_state("domcontentloaded", timeout=60000)
+                        page.wait_for_load_state("networkidle", timeout=30000)
+                        time.sleep(1.5)
+                        cur, html = _playwright_snapshot(page)
+                    except Exception:
+                        pass
+                if pw_debug:
+                    alert = ""
+                    try:
+                        alert = (
+                            page.locator(".alert-danger, .validation-summary-errors, .text-danger")
+                            .first.inner_text(timeout=1500)
+                            .strip()
+                        )
+                    except Exception:
+                        alert = ""
+                    # Also read raw validation summary from DOM in case CSS selectors miss it.
+                    try:
+                        dom_err = page.evaluate(
+                            """() => {
+                                const v = document.querySelector('.validation-summary, .validation-summary-errors, .alert-danger');
+                                return v ? (v.innerText || '').trim() : '';
+                            }"""
+                        )
+                        if dom_err and not alert:
+                            alert = str(dom_err)
+                    except Exception:
+                        pass
+                    print(f"[pw-debug] submit_path={submit_path}", file=sys.stderr)
+                    print(f"[pw-debug] current_url={cur}", file=sys.stderr)
+                    if alert:
+                        print(f"[pw-debug] alert={alert}", file=sys.stderr)
+                    if auth_trace:
+                        print("[pw-debug] auth events:", file=sys.stderr)
+                        for ln in auth_trace[-20:]:
+                            print(f"[pw-debug] {ln}", file=sys.stderr)
+                    if net_trace:
+                        print("[pw-debug] last network events:", file=sys.stderr)
+                        for ln in net_trace[-20:]:
+                            print(f"[pw-debug] {ln}", file=sys.stderr)
+                raise RuntimeError("Login returned to login page in browser mode.")
+
+            if ("logincaptcha" in cur.lower()) or ("newcaptcha" in html.lower()) or ("captcha-img" in html.lower()):
+                target = parse_captcha_target_number(html)
+                tiles = collect_captcha_tiles(html)
+                selected = select_tiles_for_target(target or "", tiles) if target else []
+                for tile_id in selected:
+                    page.locator(f"#{tile_id}").click(timeout=5000)
+                _playwright_fill_login_password(page, password)
+                verify = page.locator("#btnVerify, button[type='submit'], input[type='submit']").first
+                verify.click(timeout=15000)
+                page.wait_for_load_state("domcontentloaded", timeout=90000)
+                time.sleep(2.0)
+                cur, html = _playwright_snapshot(page)
+                if _looks_like_login_page(cur, html):
+                    raise RuntimeError("Captcha flow returned to login page in browser mode.")
+
+            if os.environ.get("SPAIN_VISA_STEP2_BOOK_NOW", "1").strip() != "0":
+                target = _absolute_url(book_override) if book_override else find_book_new_appointment_url(html, cur)
+                if target:
+                    page.goto(target, wait_until="domcontentloaded", timeout=90000)
+                    time.sleep(2.0)
+                    cur, html = _playwright_snapshot(page)
+                    if _looks_like_login_page(cur, html):
+                        raise RuntimeError("Step 2 redirected back to login in browser mode.")
+
+            return FlowResult(cur, 200, html)
+    except PlaywrightTimeoutError as e:
+        raise RuntimeError(f"Playwright timeout: {e}") from e
+    except RuntimeError:
+        hold = _env_float("SPAIN_VISA_PLAYWRIGHT_HOLD_ON_FAIL_SEC", 5.0 if not headless else 0.0)
+        if hold > 0:
+            time.sleep(hold)
+        raise
+    finally:
+        try:
+            if browser is not None:
+                browser.close()
+        except Exception:
+            pass
 
 
 def main() -> None:
@@ -518,7 +1143,8 @@ def main() -> None:
         )
         sys.exit(1)
     try:
-        resp = run_flow(email, password)
+        use_pw = os.environ.get("SPAIN_VISA_USE_PLAYWRIGHT", "0").strip() == "1"
+        resp = run_flow_playwright(email, password) if use_pw else run_flow(email, password)
         print("Final URL:", resp.url)
         print("Status:", resp.status_code)
         print(resp.text[:2000])
@@ -546,10 +1172,24 @@ def main() -> None:
                 "  • Confirm email/password work in a normal browser on the same site.",
                 file=sys.stderr,
             )
+    except RuntimeError as e:
+        print("Flow stopped:", e, file=sys.stderr)
+        print(
+            "The site is still rejecting automated session authentication. "
+            "Use a fresh network/IP and verify manual login first, then retry once.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
     except requests.RequestException as e:
         r = getattr(e, "response", None)
         if r is not None and r.status_code == 429:
             print_429_help()
+        elif _is_transient_network_reset_error(e):
+            print(
+                "Connection was reset by remote host (likely anti-bot edge/network protection). "
+                "Try later or switch network/IP.",
+                file=sys.stderr,
+            )
         print("HTTP error:", e, file=sys.stderr)
         sys.exit(1)
 
