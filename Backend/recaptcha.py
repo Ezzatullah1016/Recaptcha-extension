@@ -33,6 +33,10 @@ Optional:
     after login/captcha when possible, "0" to stop at the first post-login page.
   SPAIN_VISA_BOOK_URL — optional absolute/relative URL override for step 2 (e.g.
     /Global/appointment/newappointment).
+  SPAIN_VISA_IGNORE_LOGIN_ERR — set to "1" to still attempt "Book New Appointment" when the
+    server redirects to /Global/account/Login?err=... (opaque token). Uses SPAIN_VISA_BOOK_URL
+    if set, otherwise /Global/appointment/newappointment. Session may still be rejected if
+    login did not issue valid cookies.
   SPAIN_VISA_PLAYWRIGHT_DEBUG — "1" to print Playwright URL/status trace and server alerts.
   SPAIN_VISA_PLAYWRIGHT_HOLD_ON_FAIL_SEC — keep browser open N seconds on failure (default 5 in headed mode).
 
@@ -40,7 +44,21 @@ Dependencies: pip install requests beautifulsoup4 pillow
 OCR (recommended): install Tesseract, then pip install pytesseract
 OCR fallback (optional, stronger on noisy images): pip install easyocr opencv-python numpy
 Browser mode (recommended when requests login is blocked): pip install playwright
-  then run once: playwright install chromium
+  then install Chromium for that Python (Windows: the playwright CLI is often not on PATH):
+    py -m playwright install chromium
+
+  Proxy (optional — only where allowed by the site’s terms and applicable law):
+  SPAIN_VISA_PROXY — single proxy URL for both http and https, e.g. http://host:8080 or
+    http://user:pass@host:8080 (must be reachable; a placeholder like 127.0.0.1:8080 fails if nothing listens).
+  SPAIN_VISA_HTTP_PROXY / SPAIN_VISA_HTTPS_PROXY — set separately if needed (https falls back to http).
+  SPAIN_VISA_PROXY_LIST — comma/semicolon/newline-separated URLs, or path to a text file (one proxy per line,
+    lines starting with # ignored). One entry is chosen at random when the session starts (same proxy for the
+    whole run). Proxies do not bypass consent or anti-abuse rules; combine with pacing env vars above.
+  SPAIN_VISA_DISABLE_PROXY — set to "1" to ignore all proxy env vars (direct connection).
+  SPAIN_VISA_PROXY_DEBUG — set to "1" to log proxy host/port (no password).
+
+This tool is for personal/automation assistance on sites you are authorized to use. Do not use proxies to
+violate terms of service, robots.txt where enforceable, or local laws.
 """
 
 from __future__ import annotations
@@ -54,7 +72,7 @@ import re
 import sys
 import time
 from typing import Any
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlparse
 
 import requests
 from bs4 import BeautifulSoup
@@ -63,6 +81,8 @@ BASE = "https://appointment.thespainvisa.com"
 LOGIN_PAGE = f"{BASE}/Global/account/login"
 # Reference captcha URL shape (after login); `data` query is server-specific.
 CAPTCHA_PAGE_TEMPLATE = f"{BASE}/Global/newcaptcha/logincaptcha?data="
+# Used when the login page shows ?err= and has no book link, or when forcing step 2.
+DEFAULT_BOOK_NEW_APPOINTMENT_URL = f"{BASE}/Global/appointment/newappointment"
 
 DEFAULT_HEADERS = {
     "User-Agent": (
@@ -81,6 +101,102 @@ DEFAULT_HEADERS = {
 }
 
 _LAST_REQUEST_TS = 0.0
+
+
+def _normalize_proxy_url(url: str) -> str:
+    u = (url or "").strip()
+    if not u:
+        return ""
+    if "://" not in u:
+        u = "http://" + u
+    return u
+
+
+def _load_proxy_pool_from_env() -> list[str]:
+    raw = os.environ.get("SPAIN_VISA_PROXY_LIST", "").strip()
+    if not raw:
+        return []
+    path = os.path.expanduser(raw)
+    if os.path.isfile(path):
+        out: list[str] = []
+        with open(path, encoding="utf-8", errors="replace") as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                nu = _normalize_proxy_url(line)
+                if nu:
+                    out.append(nu)
+        return out
+    parts = re.split(r"[\s,;]+", raw)
+    return [_normalize_proxy_url(p) for p in parts if p.strip()]
+
+
+def build_requests_proxies() -> dict[str, str] | None:
+    """Return requests.Session proxies dict, or None if unset."""
+    if os.environ.get("SPAIN_VISA_DISABLE_PROXY", "").strip() == "1":
+        return None
+    single = os.environ.get("SPAIN_VISA_PROXY", "").strip()
+    http_p = os.environ.get("SPAIN_VISA_HTTP_PROXY", "").strip()
+    https_p = os.environ.get("SPAIN_VISA_HTTPS_PROXY", "").strip()
+    pool = _load_proxy_pool_from_env()
+
+    if single:
+        u = _normalize_proxy_url(single)
+        return {"http": u, "https": u}
+    if http_p or https_p:
+        out: dict[str, str] = {}
+        if http_p:
+            out["http"] = _normalize_proxy_url(http_p)
+        if https_p:
+            out["https"] = _normalize_proxy_url(https_p)
+        elif http_p:
+            out["https"] = out["http"]
+        return out or None
+    if pool:
+        u = random.choice(pool)
+        return {"http": u, "https": u}
+    return None
+
+
+def _proxy_log_safe(proxies: dict[str, str]) -> str:
+    u = proxies.get("https") or proxies.get("http") or ""
+    try:
+        p = urlparse(u)
+        port = f":{p.port}" if p.port else ""
+        host = p.hostname or "?"
+        return f"{p.scheme}://{host}{port}"
+    except Exception:
+        return "(proxy)"
+
+
+def playwright_proxy_from_env() -> dict[str, str] | None:
+    """Playwright browser.new_context(proxy={...}) fragment; None if no proxy configured."""
+    proxies = build_requests_proxies()
+    if not proxies:
+        return None
+    url = proxies.get("https") or proxies.get("http") or ""
+    if not url:
+        return None
+    parsed = urlparse(url)
+    if not parsed.scheme or not parsed.hostname:
+        return None
+    port = parsed.port or (443 if parsed.scheme == "https" else 80)
+    server = f"{parsed.scheme}://{parsed.hostname}:{port}"
+    pw: dict[str, str] = {"server": server}
+    if parsed.username:
+        pw["username"] = parsed.username
+    if parsed.password:
+        pw["password"] = parsed.password
+    return pw
+
+
+def _apply_proxies_to_session(session: requests.Session) -> None:
+    proxies = build_requests_proxies()
+    if proxies:
+        session.proxies.update(proxies)
+        if os.environ.get("SPAIN_VISA_PROXY_DEBUG", "0").strip() == "1":
+            print(f"[proxy] Using {_proxy_log_safe(proxies)}", file=sys.stderr)
 
 
 def _pace_requests() -> None:
@@ -133,9 +249,20 @@ def _is_transient_network_reset_error(exc: BaseException) -> bool:
     return any(m in msg for m in markers)
 
 
+def _login_err_in_url(url: str) -> bool:
+    return bool(re.search(r"[?&]err=", url or "", re.I))
+
+
+def _ignore_login_err_for_book_step() -> bool:
+    return os.environ.get("SPAIN_VISA_IGNORE_LOGIN_ERR", "0").strip() == "1"
+
+
 def _looks_like_login_page(url: str, html: str) -> bool:
     ul = (url or "").lower()
-    if "/account/login" in ul:
+    # Do not treat captcha / post-login pages as "login" just because they share generic markers.
+    if "newcaptcha" in ul or "logincaptcha" in ul:
+        return False
+    if "/global/account/login" in ul:
         return True
     hl = (html or "").lower()
     markers = (
@@ -672,15 +799,20 @@ def open_book_new_appointment(
     session: requests.Session,
     page_html: str,
     page_url: str,
+    forced_target: str | None = None,
 ) -> requests.Response | None:
     if os.environ.get("SPAIN_VISA_STEP2_BOOK_NOW", "1").strip() == "0":
         return None
 
-    override = os.environ.get("SPAIN_VISA_BOOK_URL", "").strip()
-    if override:
-        target = _absolute_url(override) if not override.startswith("http") else override
+    if forced_target:
+        ft = forced_target.strip()
+        target = _absolute_url(ft) if not ft.startswith("http") else ft
     else:
-        target = find_book_new_appointment_url(page_html, page_url)
+        override = os.environ.get("SPAIN_VISA_BOOK_URL", "").strip()
+        if override:
+            target = _absolute_url(override) if not override.startswith("http") else override
+        else:
+            target = find_book_new_appointment_url(page_html, page_url)
 
     if not target:
         return None
@@ -698,6 +830,7 @@ def open_book_new_appointment(
 def run_flow(email: str, password: str) -> requests.Response:
     session = requests.Session()
     session.headers.update(DEFAULT_HEADERS)
+    _apply_proxies_to_session(session)
 
     captcha_only = os.environ.get("SPAIN_VISA_CAPTCHA_URL", "").strip()
     if captcha_only:
@@ -715,6 +848,11 @@ def run_flow(email: str, password: str) -> requests.Response:
         print_429_help()
         raise RuntimeError("Rate-limit block page detected; stopping before next step.")
     if _looks_like_login_page(final_url, html):
+        if _ignore_login_err_for_book_step() and _login_err_in_url(final_url):
+            rel = os.environ.get("SPAIN_VISA_BOOK_URL", "").strip() or DEFAULT_BOOK_NEW_APPOINTMENT_URL
+            step2 = open_book_new_appointment(session, html, final_url, forced_target=rel)
+            if step2 is not None and not _looks_like_login_page(step2.url, step2.text):
+                return step2
         raise RuntimeError(
             "Authentication did not establish a logged-in session (returned to login page)."
         )
@@ -741,6 +879,13 @@ def run_flow(email: str, password: str) -> requests.Response:
 
     after_captcha = submit_captcha(session, html, final_url, password, selected)
     if _looks_like_login_page(after_captcha.url, after_captcha.text):
+        if _ignore_login_err_for_book_step() and _login_err_in_url(after_captcha.url):
+            rel = os.environ.get("SPAIN_VISA_BOOK_URL", "").strip() or DEFAULT_BOOK_NEW_APPOINTMENT_URL
+            step2 = open_book_new_appointment(
+                session, after_captcha.text, after_captcha.url, forced_target=rel
+            )
+            if step2 is not None and not _looks_like_login_page(step2.url, step2.text):
+                return step2
         raise RuntimeError(
             "Captcha/login flow returned to login page; session is not authenticated yet."
         )
@@ -871,10 +1016,29 @@ def _playwright_fill_login_fields(page: Any, email: str, password: str) -> tuple
                         return t === "password" || k.includes("pass");
                     });
 
-                    const pickEmail =
-                        emailCandidates.find((el) => !hasCls(el, "entry-disabled")) ||
-                        emailCandidates[0] ||
-                        null;
+                    const norm = (s) => (s || "").trim().toLowerCase();
+                    const emailNorm = norm(emailVal);
+
+                    // Prefer the one enabled field the page exposes (not entry-disabled).
+                    let pickEmail =
+                        emailCandidates.find((el) => !hasCls(el, "entry-disabled")) || null;
+
+                    // If everything is still honeypot-disabled, prefer a field that already matches
+                    // the intended email (server sometimes pre-seeds the active slot).
+                    if (!pickEmail && emailNorm) {
+                        pickEmail =
+                            emailCandidates.find((el) => norm(el.value) === emailNorm) || null;
+                    }
+
+                    // Never pick a honeypot that already contains a different email value.
+                    if (pickEmail && emailNorm && norm(pickEmail.value) && norm(pickEmail.value) !== emailNorm) {
+                        pickEmail = null;
+                    }
+
+                    // Last resort: first candidate (still risky, but better than nothing).
+                    if (!pickEmail) {
+                        pickEmail = emailCandidates[0] || null;
+                    }
                     const pickPw =
                         pwCandidates.find((el) => !hasCls(el, "entry-disabled")) ||
                         pwCandidates[0] ||
@@ -978,7 +1142,7 @@ def run_flow_playwright(email: str, password: str) -> FlowResult:
     except Exception as e:
         raise RuntimeError(
             "Playwright mode requested but dependency is missing. "
-            "Install with: pip install playwright && playwright install chromium"
+            "Install with: pip install playwright  then  py -m playwright install chromium"
         ) from e
 
     book_override = os.environ.get("SPAIN_VISA_BOOK_URL", "").strip()
@@ -988,11 +1152,17 @@ def run_flow_playwright(email: str, password: str) -> FlowResult:
     try:
         with sync_playwright() as p:
             browser = p.chromium.launch(headless=headless)
-            context = browser.new_context(
-                user_agent=DEFAULT_HEADERS["User-Agent"],
-                locale="en-GB",
-                timezone_id="Asia/Karachi",
-            )
+            ctx_opts: dict[str, Any] = {
+                "user_agent": DEFAULT_HEADERS["User-Agent"],
+                "locale": "en-GB",
+                "timezone_id": "Asia/Karachi",
+            }
+            pw_proxy = playwright_proxy_from_env()
+            if pw_proxy:
+                ctx_opts["proxy"] = pw_proxy
+                if os.environ.get("SPAIN_VISA_PROXY_DEBUG", "0").strip() == "1":
+                    print(f"[proxy] Playwright {pw_proxy.get('server', '')}", file=sys.stderr)
+            context = browser.new_context(**ctx_opts)
             page = context.new_page()
             net_trace: list[str] = []
             auth_trace: list[str] = []
@@ -1014,7 +1184,18 @@ def run_flow_playwright(email: str, password: str) -> FlowResult:
                     except Exception:
                         pass
                 page.on("response", _on_response)
-            page.goto(LOGIN_PAGE, wait_until="domcontentloaded", timeout=90000)
+            try:
+                page.goto(LOGIN_PAGE, wait_until="domcontentloaded", timeout=90000)
+            except Exception as e:
+                err_txt = str(e)
+                if "ERR_PROXY_CONNECTION_FAILED" in err_txt or "ERR_TUNNEL_CONNECTION_FAILED" in err_txt:
+                    raise RuntimeError(
+                        "Browser could not use the configured proxy (connection failed). "
+                        "Ensure the proxy is running and the host/port are correct, or unset SPAIN_VISA_PROXY "
+                        "(and related proxy env vars). Example: http://127.0.0.1:8080 only works if a proxy listens "
+                        "on port 8080. To force a direct connection: SPAIN_VISA_DISABLE_PROXY=1"
+                    ) from e
+                raise
 
             if _is_rate_limit_html(page.content()):
                 raise RuntimeError("Rate-limit block page detected in browser mode.")
@@ -1027,6 +1208,7 @@ def run_flow_playwright(email: str, password: str) -> FlowResult:
             # Some login variants only require email first and request password/captcha next.
             # Do not hard-fail if password field is missing on the initial screen.
 
+            already_opened_book = False
             submit_path = _playwright_submit_login(page)
             page.wait_for_load_state("domcontentloaded", timeout=90000)
             page.wait_for_load_state("networkidle", timeout=30000)
@@ -1056,41 +1238,52 @@ def run_flow_playwright(email: str, password: str) -> FlowResult:
                         cur, html = _playwright_snapshot(page)
                     except Exception:
                         pass
-                if pw_debug:
-                    alert = ""
-                    try:
-                        alert = (
-                            page.locator(".alert-danger, .validation-summary-errors, .text-danger")
-                            .first.inner_text(timeout=1500)
-                            .strip()
-                        )
-                    except Exception:
+                if _looks_like_login_page(cur, html):
+                    if _ignore_login_err_for_book_step() and _login_err_in_url(cur):
+                        rel = book_override or DEFAULT_BOOK_NEW_APPOINTMENT_URL
+                        book_url = _absolute_url(rel) if not rel.startswith("http") else rel
+                        try:
+                            page.goto(book_url, wait_until="domcontentloaded", timeout=90000)
+                            time.sleep(2.0)
+                            cur, html = _playwright_snapshot(page)
+                            already_opened_book = True
+                        except Exception:
+                            pass
+                if _looks_like_login_page(cur, html):
+                    if pw_debug:
                         alert = ""
-                    # Also read raw validation summary from DOM in case CSS selectors miss it.
-                    try:
-                        dom_err = page.evaluate(
-                            """() => {
-                                const v = document.querySelector('.validation-summary, .validation-summary-errors, .alert-danger');
-                                return v ? (v.innerText || '').trim() : '';
-                            }"""
-                        )
-                        if dom_err and not alert:
-                            alert = str(dom_err)
-                    except Exception:
-                        pass
-                    print(f"[pw-debug] submit_path={submit_path}", file=sys.stderr)
-                    print(f"[pw-debug] current_url={cur}", file=sys.stderr)
-                    if alert:
-                        print(f"[pw-debug] alert={alert}", file=sys.stderr)
-                    if auth_trace:
-                        print("[pw-debug] auth events:", file=sys.stderr)
-                        for ln in auth_trace[-20:]:
-                            print(f"[pw-debug] {ln}", file=sys.stderr)
-                    if net_trace:
-                        print("[pw-debug] last network events:", file=sys.stderr)
-                        for ln in net_trace[-20:]:
-                            print(f"[pw-debug] {ln}", file=sys.stderr)
-                raise RuntimeError("Login returned to login page in browser mode.")
+                        try:
+                            alert = (
+                                page.locator(".alert-danger, .validation-summary-errors, .text-danger")
+                                .first.inner_text(timeout=1500)
+                                .strip()
+                            )
+                        except Exception:
+                            alert = ""
+                        try:
+                            dom_err = page.evaluate(
+                                """() => {
+                                    const v = document.querySelector('.validation-summary, .validation-summary-errors, .alert-danger');
+                                    return v ? (v.innerText || '').trim() : '';
+                                }"""
+                            )
+                            if dom_err and not alert:
+                                alert = str(dom_err)
+                        except Exception:
+                            pass
+                        print(f"[pw-debug] submit_path={submit_path}", file=sys.stderr)
+                        print(f"[pw-debug] current_url={cur}", file=sys.stderr)
+                        if alert:
+                            print(f"[pw-debug] alert={alert}", file=sys.stderr)
+                        if auth_trace:
+                            print("[pw-debug] auth events:", file=sys.stderr)
+                            for ln in auth_trace[-20:]:
+                                print(f"[pw-debug] {ln}", file=sys.stderr)
+                        if net_trace:
+                            print("[pw-debug] last network events:", file=sys.stderr)
+                            for ln in net_trace[-20:]:
+                                print(f"[pw-debug] {ln}", file=sys.stderr)
+                    raise RuntimeError("Login returned to login page in browser mode.")
 
             if ("logincaptcha" in cur.lower()) or ("newcaptcha" in html.lower()) or ("captcha-img" in html.lower()):
                 target = parse_captcha_target_number(html)
@@ -1105,16 +1298,30 @@ def run_flow_playwright(email: str, password: str) -> FlowResult:
                 time.sleep(2.0)
                 cur, html = _playwright_snapshot(page)
                 if _looks_like_login_page(cur, html):
-                    raise RuntimeError("Captcha flow returned to login page in browser mode.")
+                    if _ignore_login_err_for_book_step() and _login_err_in_url(cur):
+                        rel = book_override or DEFAULT_BOOK_NEW_APPOINTMENT_URL
+                        book_url = _absolute_url(rel) if not rel.startswith("http") else rel
+                        try:
+                            page.goto(book_url, wait_until="domcontentloaded", timeout=90000)
+                            time.sleep(2.0)
+                            cur, html = _playwright_snapshot(page)
+                            already_opened_book = True
+                        except Exception:
+                            pass
+                    if _looks_like_login_page(cur, html):
+                        raise RuntimeError("Captcha flow returned to login page in browser mode.")
 
             if os.environ.get("SPAIN_VISA_STEP2_BOOK_NOW", "1").strip() != "0":
-                target = _absolute_url(book_override) if book_override else find_book_new_appointment_url(html, cur)
-                if target:
-                    page.goto(target, wait_until="domcontentloaded", timeout=90000)
-                    time.sleep(2.0)
-                    cur, html = _playwright_snapshot(page)
-                    if _looks_like_login_page(cur, html):
-                        raise RuntimeError("Step 2 redirected back to login in browser mode.")
+                if already_opened_book and "newappointment" in cur.lower():
+                    pass
+                else:
+                    target = _absolute_url(book_override) if book_override else find_book_new_appointment_url(html, cur)
+                    if target:
+                        page.goto(target, wait_until="domcontentloaded", timeout=90000)
+                        time.sleep(2.0)
+                        cur, html = _playwright_snapshot(page)
+                        if _looks_like_login_page(cur, html):
+                            raise RuntimeError("Step 2 redirected back to login in browser mode.")
 
             return FlowResult(cur, 200, html)
     except PlaywrightTimeoutError as e:
@@ -1148,7 +1355,10 @@ def main() -> None:
         print("Final URL:", resp.url)
         print("Status:", resp.status_code)
         print(resp.text[:2000])
-        if re.search(r"[?&]err=", resp.url, re.I) or "alert-danger" in resp.text:
+        if (
+            "newappointment" not in resp.url.lower()
+            and (re.search(r"[?&]err=", resp.url, re.I) or "alert-danger" in resp.text)
+        ):
             try:
                 alert = BeautifulSoup(resp.text, "html.parser").select_one(".alert-danger")
                 if alert and alert.get_text(strip=True):
@@ -1169,6 +1379,8 @@ def main() -> None:
                 "  • Try posting only the active email field: "
                 '$env:SPAIN_VISA_LOGIN_POST_ACTIVE_EMAIL_ONLY="1"\n'
                 '  • See which field the script picks: $env:SPAIN_VISA_LOGIN_DEBUG="1"\n',
+                "  • Login redirects to ?err= but you want to try booking anyway: "
+                '$env:SPAIN_VISA_IGNORE_LOGIN_ERR="1" (optional $env:SPAIN_VISA_BOOK_URL for a custom path).\n'
                 "  • Confirm email/password work in a normal browser on the same site.",
                 file=sys.stderr,
             )

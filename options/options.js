@@ -8,6 +8,7 @@
   var loginAssistEnabled = document.getElementById("loginAssistEnabled");
   var loginEmail = document.getElementById("loginEmail");
   var loginPassword = document.getElementById("loginPassword");
+  var ignoreLoginErr = document.getElementById("ignoreLoginErr");
 
   function fill(opts) {
     theme.value = opts.theme === "dark" ? "dark" : "light";
@@ -47,6 +48,7 @@
       notificationsEnabled: notifications.checked,
       targetLoginUrl: url,
       loginAssistEnabled: loginAssistEnabled.checked,
+      ignoreLoginErr: ignoreLoginErr.checked,
     })
       .then(function (opts) {
         return AppState.pruneLogsForRetention(opts.logRetentionDays);

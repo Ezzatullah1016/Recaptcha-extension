@@ -39,6 +39,13 @@
             <input id="loginAssistEnabled" type="checkbox" />
             <span>Enable automatic form fill when the page loads</span>
           </label>
+          <label class="row row-check">
+            <input id="ignoreLoginErr" type="checkbox" />
+            <span
+              >After login, if the site shows <code>?err=</code> on the login URL, go to Book New Appointment
+              once (same idea as Python <code>SPAIN_VISA_IGNORE_LOGIN_ERR=1</code>)</span
+            >
+          </label>
           <label class="row">
             <span>Account email</span>
             <input id="loginEmail" class="field-input" type="email" autocomplete="off" />

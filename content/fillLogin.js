@@ -241,6 +241,15 @@
         var submitted = false;
         var stage = "unknown";
 
+        if (onLoginishPage() && /[?&]err=/i.test(location.search || "")) {
+          if (o && o.ignoreLoginErr === true && oncePerPath("login_err_skip_book")) {
+            try {
+              location.assign("https://" + SITE_HOST + "/Global/appointment/newappointment");
+            } catch (e) {}
+            return;
+          }
+        }
+
         if (isRateLimitPage()) {
           var scheduled = false;
           if (shouldScheduleRateLimitRetry()) {
