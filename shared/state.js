@@ -22,6 +22,7 @@
     notificationsEnabled: true,
     targetLoginUrl: "https://appointment.thespainvisa.com/Global/account/login",
     loginAssistEnabled: true,
+    ignoreLoginErr: false,
   };
 
   var LOCAL_LOGIN_KEY = "extLocalLoginProfile";
